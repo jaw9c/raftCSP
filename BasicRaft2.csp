@@ -1,0 +1,313 @@
+channel tock
+
+above(x) = {y | y <- Term, x<y}
+below(x) = {y | y <- Term, x>y}
+aboveOrEqual(x) = {y | y <- Term, x<=y}
+Not(n) = diff(Node,{n})
+
+maxTerm = 3
+maxIndex = 4
+N = 3
+Node = {0..N-1}
+Term = {0..maxTerm}
+Index = { 0..maxIndex}
+
+electionTimeout = 2
+LeaderTimer = 1
+
+--Channel definitions to represent the internal messages from node to node
+channel requestVote : Node.Node.Term.Index.Term
+channel appendEntries : Node.Node.Term.Index.Term.Index.Bool
+channel appendEntriesReply : Node.Node.Term.Bool
+channel requestVoteReply : Node.Node.Term.Bool
+
+channel fail : Node
+channel revive : Node
+channel signalLeader : Node.Term
+
+--Channels for the leader's indexes
+channel nextIndexGet : Node.Node.Index
+channel nextIndexSet : Node.Node.Index
+channel matchIndexGet : Node.Node.Index
+channel matchIndexSet : Node.Node.Index
+--Channels for the log process
+channel logGetTerm : Node.Index.Term
+channel logLength : Node.Index
+channel logAppend : Node.Term
+channel logRemoveFrom : Node.Index
+
+channel clientRequest : Node.Bool
+channel clogGetTerm : Index.Term
+channel clogAppend : Term
+channel signalCommited : Index.Term
+channel giveMaxCommit : Index
+
+--These processes initialise the NextIndex 'array' of the leader
+InitaliseNewLeader(n,term,votedFor,commitIndex,lastApplied) = logLength!n?length -> (if(length != maxIndex) then
+																			 InitaliseNewLeader'(n,term,votedFor,commitIndex,lastApplied, length+1,N-1) else STOP)
+InitaliseNewLeader'(n,term,votedFor,commitIndex,lastApplied, intialNext,-1) = Leader'(n,term,votedFor,LeaderTimer,Not(n),commitIndex,lastApplied)
+InitaliseNewLeader'(n,term,votedFor,commitIndex,lastApplied, intialNext,currNode) = nextIndexSet!n!currNode!intialNext -> matchIndexSet!n!currNode!0 ->
+                                                                       InitaliseNewLeader'(n,term,votedFor,commitIndex,lastApplied,intialNext, currNode-1)
+
+
+--State for when node n is running as a leader
+Leader(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied) =
+if(term == maxTerm-1) then STOP else(
+	if timeout==0 then Leader(n,term,votedFor,LeaderTimer,Not(n),commitIndex,lastApplied)
+	else Leader'(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied))
+
+Leader'(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied) =
+	if(term >= maxTerm-1) then STOP else (
+	 nextIndexGet!n?to:noReplys?nextIndex:diff(Index,{0, 1}) 
+	     -> logGetTerm!n!nextIndex-1?prevTerm 
+	        -> logLength!n?length 
+	            -> (appendEntries!n!to!term!nextIndex-1!prevTerm!commitIndex!(nextIndex<=length) 
+	            	-> Leader'(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied)
+					[] LeaderRevicingMessages(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied))
+	[] nextIndexGet!n?to:noReplys!1 -> logLength!n?length -> (appendEntries!n!to!term!0!0!commitIndex!(length>0) -> Leader'(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied)
+																[] LeaderRevicingMessages(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied))
+	[] noReplys == {} & LeaderRevicingMessages(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied) 
+	[] logGetTerm!n?index:{1..commitIndex}?term -> signalCommited!index!term -> Leader'(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied)
+    [] giveMaxCommit?p -> Leader'(n,term,votedFor,timeout,noReplys,p,lastApplied))
+
+LeaderRevicingMessages(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied) =
+	 clientRequest!n?True -> logAppend!n!term -> logLength?l -> matchIndexSet!n!l -> Leader'(n,term,votedFor,timeout,Not(n),commitIndex,lastApplied)
+	[] appendEntriesReply?from:Not(n)!n!term!False -> nextIndexGet!n!from?prev -> ((prev >1 & nextIndexSet!n!from!(prev-1) 
+																								-> Leader'(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied))
+																			[]	(prev <= 1 & Leader'(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied)))
+	[] appendEntriesReply?from:Not(n)!n!term!True -> nextIndexGet!n!from?prev -> (if(prev != maxIndex) then (nextIndexSet!n!from!(prev+1) -> matchIndexSet!n!from!prev ->
+			logLength!n?length ->( ((length < prev+1 & Leader'(n,term,votedFor,timeout,diff(noReplys,{from}),commitIndex,lastApplied))
+								[] (length >= prev+1 & Leader'(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied)))))
+																			else STOP)
+	[] appendEntries?from:Not(n)!n!term?pi?pt?ci?ent -> Leader'(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied)
+	[] requestVote?from:Not(n)!n!term?lastIndex?lastTerm -> requestVoteReply!n!from!term!False -> Leader'(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied)
+	[] requestVoteReply?from:Not(n)!n!term?voteGranted -> Leader'(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied)
+    [] HigherTermMsg(n,term,commitIndex,lastApplied)
+    [] LowerTermMsg(Leader'(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied),n,term)
+
+	[] fail.n -> Failed(n,term,votedFor)
+	[] signalLeader!n!term -> Leader(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied)
+	[] tock -> Leader(n,term,votedFor,timeout,noReplys,commitIndex,lastApplied)
+
+
+--Follower State
+Follower(n,term,votedFor,timeout,commitIndex,lastApplied) =
+	if(term == maxTerm-1) then STOP
+	else(if timeout==0 then StartElection(n,term,votedFor,commitIndex,lastApplied) --If we timeout, start a new election
+		else Follower'(n,term,votedFor,timeout,commitIndex,lastApplied))
+
+Follower'(n,term,votedFor,timeout,commitIndex,lastApplied) =
+
+	appendEntries?from:Not(n)!n!term?prevIndex?prevTerm?leaderCommitIndex!False -> logLength!n?length ->
+		(
+		--Here we check if message is consistent with our log, obviously if the messages refers to an index we don't have then we reject it
+		(prevIndex > length & appendEntriesReply!n!from!term!False -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+		--Otherwise we get the element's term and compare terms, If the terms match then we are consistent, otherwise not.
+		[] (prevIndex <= length & logGetTerm!n!prevIndex?logTerm 
+			-> appendEntriesReply!n!from!term!(prevTerm == logTerm) -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+
+		)
+	--Second for the sending of data in the append entries
+	[] appendEntries?from:Not(n)!n!term?prevIndex?prevTerm?leaderCommitIndex!True -> logLength!n?length ->
+		(
+		--Again this part of the log we don not contain
+		(prevIndex > length & appendEntriesReply!n!from!term!False -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+		--This is if the message refers to part of the log that is not the last element, hence it is trying to replace part of the log.
+		[] (prevIndex < length & logGetTerm!n!prevIndex?logTerm ->
+			(
+			(prevTerm == logTerm & appendEntriesReply!n!from!term!True -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+			--If we fail then we remove everything from the index checked onwards in our log
+			[] (prevTerm != logTerm & logRemoveFrom!n!prevIndex -> appendEntriesReply!n!from!term!False -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+			))
+		--This is if the message refers to the last element in the log, hence we are adding new entries to the log only if the consistency check passes
+		[] (prevIndex == length & logGetTerm!n!length?logTerm ->
+			(
+			(prevTerm == logTerm & logAppend!n!prevTerm -> appendEntriesReply!n!from!term!True -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+			[] (prevTerm != logTerm & logRemoveFrom!n!prevIndex -> appendEntriesReply!n!from!term!False -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+			))
+		)
+	
+	[] requestVote?from:Not(n)!n!term?lastIndex?lastTerm -> (if(votedFor == -1 or votedFor == from) then logLength!n?length -> logGetTerm!n!length?ourLastTerm -> (
+			(lastTerm == ourLastTerm and lastIndex >= length & requestVoteReply!n!from!term!True -> Follower(n,term,from,electionTimeout,commitIndex,lastApplied))
+			[] (lastTerm == ourLastTerm and lastIndex < length & requestVoteReply!n!from!term!False -> Follower(n,term,-1,electionTimeout,commitIndex,lastApplied))
+			[] (lastTerm != ourLastTerm and lastTerm >= ourLastTerm & requestVoteReply!n!from!term!True -> Follower(n,term,from,electionTimeout,commitIndex,lastApplied))
+			[] (lastTerm != ourLastTerm and lastTerm < ourLastTerm & requestVoteReply!n!from!term!False -> Follower(n,term,-1,electionTimeout,commitIndex,lastApplied))
+			) else requestVoteReply!n!from!term!False -> Follower'(n,term,votedFor,timeout,commitIndex,lastApplied))
+
+	[] appendEntriesReply?from:Not(n)!n!term?success -> Follower'(n,term,votedFor,timeout,commitIndex,lastApplied)
+	[] requestVoteReply?from:Not(n)!n!term?voteGranted -> Follower'(n,term,votedFor,timeout,commitIndex,lastApplied)
+
+	[] LowerTermMsg(Follower'(n,term,votedFor,timeout,commitIndex,lastApplied),n,term)
+	[] HigherTermMsg(n,term,commitIndex,lastApplied)
+
+	[] fail.n -> Failed(n,term,votedFor)
+	[] tock -> Follower(n,term,votedFor,timeout-1,commitIndex,lastApplied)
+    [] logGetTerm!n?index:{1..commitIndex}?term -> signalCommited!index!term -> Follower'(n,term,votedFor,timeout,commitIndex,lastApplied)
+
+StartElection(n,term,votedFor,commitIndex,lastApplied) = Candidate(n,term+1,n,1,electionTimeout,diff(Node,{n}),commitIndex,lastApplied)
+
+Candidate(n,term,votedFor,votes,timeout,noReplys,commitIndex,lastApplied) =
+	if(term >= maxTerm-1) then STOP
+		else (if (votes >= N/2) then InitaliseNewLeader(n,term,votedFor,commitIndex,lastApplied)
+				else (if timeout == 0 then StartElection(n,term,votedFor,commitIndex,lastApplied)
+						else Candidate'(n,term,votedFor,votes,timeout,noReplys,commitIndex,lastApplied)))
+
+Candidate'(n,term,votedFor,votes,timeout,noReplys,commitIndex,lastApplied) =
+
+	logLength!n?length -> logGetTerm!n!length?lastTerm -> requestVote!n?to:noReplys!term!length!lastTerm -> Candidate'(n,term,votedFor,votes,timeout,noReplys,commitIndex,lastApplied)
+
+	[] appendEntries?from:Not(n)!n!term?prevIndex?prevTerm?leaderCommitIndex!False -> logLength!n?length ->
+		(
+		(prevIndex > length & appendEntriesReply!n!from!term!False -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+		[] (prevIndex <= length & logGetTerm!n!prevIndex?logTerm 
+			-> appendEntriesReply!n!from!term!(prevTerm == logTerm) -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+
+		)
+	[] appendEntries?from:Not(n)!n!term?prevIndex?prevTerm?leaderCommitIndex!True -> logLength!n?length ->
+		(
+		(prevIndex > length & appendEntriesReply!n!from!term!False -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+		[] (prevIndex < length & logGetTerm!n!prevIndex?logTerm ->
+			(
+			(prevTerm == logTerm & appendEntriesReply!n!from!term!True -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+			[] (prevTerm != logTerm & logRemoveFrom!n!prevIndex -> appendEntriesReply!n!from!term!False -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+			))
+		[] (prevIndex == length & logGetTerm!n!length?logTerm ->
+			(
+			(prevTerm == logTerm & logAppend!n!prevTerm -> appendEntriesReply!n!from!term!True -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+			[] (prevTerm != logTerm & logRemoveFrom!n!prevIndex -> appendEntriesReply!n!from!term!False -> Follower'(n,term,votedFor,electionTimeout,leaderCommitIndex,lastApplied))
+			))
+		)
+
+
+	[] requestVote?from:Not(n)!n!term?lastIndex?lastTerm -> requestVoteReply!n!from!term!False -> Candidate'(n,term,votedFor,votes,timeout,noReplys,commitIndex,lastApplied)
+	[] requestVoteReply?from:Not(n)!n!term?True -> Candidate(n,term,votedFor,votes+1,timeout,diff(noReplys,{from}),commitIndex,lastApplied)
+	[] requestVoteReply?from:Not(n)!n!term?False -> Candidate(n,term,votedFor,votes,timeout,diff(noReplys,{from}),commitIndex,lastApplied)
+	[] appendEntriesReply?from:Not(n)!n!term?success -> Candidate'(n,term,votedFor,votes,timeout,noReplys,commitIndex,lastApplied)	
+
+	[] LowerTermMsg(Candidate'(n,term,votedFor,votes,timeout,noReplys,commitIndex,lastApplied),n,term)
+	[] HigherTermMsg(n,term,commitIndex,lastApplied)
+
+	[] tock -> Candidate(n,term,votedFor,votes,timeout-1,noReplys,commitIndex,lastApplied)
+	[] fail.n -> Failed(n,term,votedFor)
+	[]logGetTerm!n?index:{1..commitIndex}?term -> signalCommited!index!term -> Candidate'(n,term,votedFor,votes,timeout,noReplys,commitIndex,lastApplied)
+
+Failed(n,term,votedFor) =
+	tock -> Failed'(n,term,votedFor)
+	[] appendEntries?from:Not(n)!n?term?pi?pt?ci?ent -> Failed(n,term,votedFor)
+	[] requestVote?from:Not(n)!n?t?li?lt -> Failed(n,term,votedFor)
+	[] appendEntriesReply?from:Not(n)!n?term?success -> Failed(n,term,votedFor)
+	[] requestVoteReply?from:Not(n)!n?term?voteGranted -> Failed(n,term,votedFor)
+
+Failed'(n,term,votedFor) =
+	tock -> Failed'(n,term,votedFor)
+	[] appendEntries?from:Not(n)!n?term?pi?pt?ci?ent -> Failed'(n,term,votedFor)
+	[] requestVote?from:Not(n)!n?t?li?lt  -> Failed'(n,term,votedFor)
+	[] appendEntriesReply?from:Not(n)!n?term?success -> Failed'(n,term,votedFor)
+	[] requestVoteReply?from:Not(n)!n?term?voteGranted -> Failed'(n,term,votedFor)
+	[] revive.n -> Follower(n,term,votedFor,electionTimeout,0,0)
+
+LowerTermMsg(PROC,n,term) =
+    appendEntries?from:Not(n)!n?term':below(term)?pi?pt?ci?ent -> appendEntriesReply!n!from!term!False -> PROC
+	[] requestVote?from:Not(n)!n?term':below(term)?lastIndex?lastTerm -> requestVoteReply!n!from!term!False -> PROC
+	[] appendEntriesReply?from:Not(n)!n?term':below(term)?success -> PROC
+	[] requestVoteReply?from:Not(n)!n?term':below(term)?voteGranted -> PROC
+
+HigherTermMsg(n,term,commitIndex,lastApplied) =
+	requestVote?from:Not(n)!n?term':above(term)?lastIndex?lastTerm -> requestVoteReply!n!from!term'!False -> Follower(n,term,-1,electionTimeout,commitIndex,lastApplied)
+	[] appendEntries?from:Not(n)!n?term':above(term)?prevIndex?prevTerm?leaderCommitIndex?entry 
+		-> appendEntriesReply!n!from!term!False ->Follower(n,term',-1,electionTimeout,commitIndex,lastApplied)
+	[] requestVoteReply?from:Not(n)!n?term':above(term)?succ -> Follower(n,term',-1,electionTimeout,commitIndex,lastApplied)
+	[] appendEntriesReply?from:Not(n)!n?term':above(term)?succ -> Follower(n,term',-1,electionTimeout,commitIndex,lastApplied)
+
+
+NextIndex'(owner,node,index) = nextIndexSet!owner!node?index' -> NextIndex'(owner,node,index') [] nextIndexGet!owner!node!index -> NextIndex'(owner,node,index)
+MatchIndex'(owner,node,index) = matchIndexSet!owner!node?index' -> MatchIndex'(owner,node,index') [] matchIndexGet!owner!node!index -> MatchIndex'(owner,node,index)
+
+
+NextIndex(owner) = || n : Node @ [NextIndexAlpha'(owner,n)] NextIndex'(owner,n,1)
+MatchIndex(owner) = || n : Node @ [MatchIndexAlpha'(owner,n)] MatchIndex'(owner,n,1)
+
+NextIndexAlpha'(owner,n) = {|nextIndexSet.owner.n.p,nextIndexGet.owner.n.p|  p <- Index|}
+MatchIndexAlpha'(owner,n) = {|matchIndexSet.owner.n.p, matchIndexGet.owner.n.p| p <- Index|}
+
+NextIndexAlpha(n) = {|nextIndexSet.n.n'.p,nextIndexGet.n.n'.p| n' <- Node, p <- Index|}
+MatchIndexAlpha(n) = {|matchIndexSet.n.n'.p, matchIndexGet.n.n'.p| p <- Index, n' <- Node|}
+
+
+IndexesForLeaderState(n) = NextIndex(n) [|{}|] MatchIndex(n)
+IndexesForLeaderStateAlpha(n) = union(NextIndexAlpha(n),MatchIndexAlpha(n))
+
+
+Log(n,log,length) = (length == 0 & logGetTerm!n!0!0 -> Log(n,log,length))
+					[] (length != 0 & logGetTerm!n?index:{1..length}!SequenceGet(log,(length - (index-1))) -> Log(n,log,length))
+					[] logLength!n!length -> Log(n,log,length)
+					[] logAppend!n?incTerm ->(if(length != maxIndex) then Log(n,concat(<<incTerm>,log>),length+1) else STOP)
+					[] logRemoveFrom!n?index:{1..length} -> Log(n,Cut(log,length - (index-1)),index-1)
+Cut(seq,0) = seq
+Cut(seq, n) = Cut(tail(seq),n-1)
+SequenceGet(seq,1) = head(seq)
+SequenceGet(seq,n) = SequenceGet(tail(seq),n-1)
+
+elemGT(sequ,i) = length(<x | x <-sequ, x >= i>)
+CommitMaxCacl(n,sequ,0) = let p = (length(<x | x <- seq(diff(Index,{0})), (elemGT(sequ,x) > (N / 2))>)) within (
+		if (p > maxIndex) then STOP else giveMaxCommit!p -> CommitMaxCacl(n,<>,N-1))
+CommitMaxCacl(n,sequ,i) = matchIndexGet!n!i?t -> CommitMaxCacl(n,<t>^sequ,i-1)
+
+
+RPCAlpha(n) = union(LogAlpha(n),union(IndexesForLeaderStateAlpha(n),union({|tock, requestVoteReply.n'.n.t.b,appendEntriesReply.n'.n.t.b,
+	appendEntries.n'.n.t.i.t'.i'.b,requestVote.n'.n.t.i.t', fail.n, revive.n | n' <- Node, t <- Term, i <- Index, i' <- Index,t' <- Term, b <- {True,False} |},
+				{|requestVoteReply.n.n'.t.b,appendEntriesReply.n.n'.t.b,appendEntries.n.n'.t.i.t'.i'.b,
+				requestVote.n.n'.t.i.t',clientRequest.n.b | n' <- Node, t <- Term, t' <- Term, i <- Index, i' <- Index, b <- {True,False}|})))
+TotalRPCAlpha = {x | n <- Node, x <- RPCAlpha(n)}
+
+LogAlpha(n) = {|logGetTerm.n.i.t, logLength.n.i, logAppend.n.t, logRemoveFrom.n.i| i <- Index, t <- Term|}
+
+ExampleLeader = ((Leader(0,0,0,1,{1,2},0,0) [|LogAlpha(0)|] Log(0,<>,0))  [|IndexesForLeaderStateAlpha(0)|] (IndexesForLeaderState(0)))
+ [|{|matchIndexGet,giveMaxCommit|}|] CommitMaxCacl(0,<>,N-1)
+
+NodeRun(n) = ((if n==0 then (Leader(0,1,1,1,{1},0,0) [|LogAlpha(n)|] Log(n,<1>,1)  \ LogAlpha(n)) [|{|giveMaxCommit|}|]
+ CommitMaxCacl(0,<>,N-1) else (Follower(n,1,0,2,0,0) [|LogAlpha(n)|] Log(n,<>,0)) \ LogAlpha(n) ) [|IndexesForLeaderStateAlpha(n)|]
+  IndexesForLeaderState(n)) \ IndexesForLeaderStateAlpha(n)
+
+Network = || n : Node @ [RPCAlpha(n)] NodeRun(n)
+
+ 
+
+topHalfNodes(n) = {x | x <- {0..((n/2))}}
+bottomHalfNodes(n) = diff(Node,topHalfNodes(n))
+SplitBrain(n) =
+	tock -> SplitBrain(n)
+	[] appendEntries?from:topHalfNodes(n)?to:topHalfNodes(n)?term -> SplitBrain(n)
+	[] requestVote?from:topHalfNodes(n)?to:topHalfNodes(n)?t -> SplitBrain(n)
+	[] appendEntriesReply?from:topHalfNodes(n)?to:topHalfNodes(n)?term?success -> SplitBrain(n)
+	[] requestVoteReply?from:topHalfNodes(n)?to:topHalfNodes(n)?term?voteGranted -> SplitBrain(n)
+	[] appendEntries?from:bottomHalfNodes(n)?to:bottomHalfNodes(n)?term -> SplitBrain(n)
+	[] requestVote?from:bottomHalfNodes(n)?to:bottomHalfNodes(n)?t -> SplitBrain(n)
+	[] appendEntriesReply?from:bottomHalfNodes(n)?to:bottomHalfNodes(n)?term?success -> SplitBrain(n)
+	[] requestVoteReply?from:bottomHalfNodes(n)?to:bottomHalfNodes(n)?term?voteGranted -> SplitBrain(n)
+	[] fail?x -> SplitBrain(n)
+
+
+Spec1(leader,2) = STOP
+Spec1(leader,term) = signalLeader!leader!term -> Spec1(leader,term) [] signalLeader?leader?term':above(term) -> Spec1(leader,term')
+
+assert Spec1(0,0) [T= (Network \ TotalRPCAlpha)
+
+cLog(log,length) = (length == 0 & clogGetTerm!0!0 -> cLog(log,length))
+					[] (length != 0 & clogGetTerm?index:{1..length}!SequenceGet(log,(length - (index-1))) -> cLog(log,length))
+					[] clogAppend?incTerm ->(if(length != maxIndex) then cLog(concat(<<incTerm>,log>),length+1) else STOP)
+
+Spec2(5) = STOP
+Spec2(length) = if (length == 0) then signalCommited?index?term -> clogAppend!term -> Spec2(1)
+	else clogGetTerm?index:{1..length}?term -> signalCommited!index!term -> Spec2(length)
+	     [] signalCommited?index:{length+1..maxIndex}?term -> clogAppend!term -> Spec2(length+1)
+
+cLogEvents = {|clogGetTerm,clogAppend|}
+
+
+assert (Spec2(0) [|cLogEvents|] cLog(<>,0) \ cLogEvents )[T= (Network \ TotalRPCAlpha)
+
+--assert Leader(0,0,0,5,{1,2}) :[deterministic]
+--assert Follower(0,0,0,2) :[deterministic]
+--assert Candidate(0,0,0,1,5,{1,2}) :[deterministic]
+--assert Network :[deterministic]
